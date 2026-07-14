@@ -46,14 +46,30 @@ from evaluate import split_train_probe, score_predictions, score_bias_only
 
 PARQUET_PATH = "dbfs:/netflix_prize_data/parquet"
 DATA_PATH = "/dbfs/netflix_prize_data"
-OUTPUT_PATH = "/dbfs/data612_final_project/sweep_artifacts"
+# split-mode-specific output so the random-split and time-split sweep results
+# both survive for the notebook's side-by-side comparison (set below)
 
 SEED = 45
 BIN_DAYS = 30
 MAX_ITER = 10
 BIAS_GRID = [(lb, ld) for lb in (50.0, 200.0, 1000.0) for ld in (500.0, 5000.0, 50000.0)]
 ALS_GRID = [(rank, reg) for rank in (20, 40) for reg in (0.05, 0.1, 0.2)]
-VALIDATION_FRACTION = 0.02
+VALIDATION_FRACTION = 0.02  # used only by split_mode="random"
+
+# split_mode widget: "time" (default) holds out each user's LAST ratings, the
+# way Netflix built probe itself; "random" is the first sweep's uniform sample.
+# The first (random-split) sweep picked rank=40/reg=0.05 at 0.7742 validation
+# RMSE that transferred to only 0.9453 on probe -- worse than untuned
+# rank=20/reg=0.1 (0.9373). Random within-history validation rewards
+# overfitting the past; probe is the future. This run tunes on a
+# probe-shaped split instead.
+try:
+    dbutils.widgets.text("split_mode", "time")
+    SPLIT_MODE = dbutils.widgets.get("split_mode").strip() or "time"
+except NameError:
+    SPLIT_MODE = "time"
+
+OUTPUT_PATH = f"/dbfs/data612_final_project/sweep_artifacts_{SPLIT_MODE}"
 
 t_start = time.time()
 
@@ -63,17 +79,36 @@ t_start = time.time()
 
 # COMMAND ----------
 
+from pyspark.sql import Window
+
 ratings_df = spark.read.parquet(PARQUET_PATH)
 probe_pairs_df = to_spark_df(spark, load_probe_pairs(DATA_PATH))
 train_full_df, probe_truth_df = split_train_probe(ratings_df, probe_pairs_df)
 
-train_df, val_df = train_full_df.randomSplit(
-    [1.0 - VALIDATION_FRACTION, VALIDATION_FRACTION], seed=SEED
-)
+if SPLIT_MODE == "time":
+    # Hold out each user's 2 most recent training ratings (only for users with
+    # >= 10 ratings, so sparse users keep their full history in training).
+    # ~1M rows -- comparable to probe's 1.4M, and shaped the same way.
+    w_user = Window.partitionBy("user_id").orderBy(
+        F.col("date").desc(), F.col("movie_id").desc()
+    )
+    flagged = train_full_df.withColumn("recency_rank", F.row_number().over(w_user))
+    flagged = flagged.withColumn(
+        "n_user", F.count("*").over(Window.partitionBy("user_id"))
+    )
+    is_val = (F.col("recency_rank") <= 2) & (F.col("n_user") >= 10)
+    val_df = flagged.filter(is_val).drop("recency_rank", "n_user")
+    train_df = flagged.filter(~is_val).drop("recency_rank", "n_user")
+else:
+    train_df, val_df = train_full_df.randomSplit(
+        [1.0 - VALIDATION_FRACTION, VALIDATION_FRACTION], seed=SEED
+    )
+
 train_df = train_df.repartition(64).cache()
 val_df = val_df.cache()
 probe_truth_df = probe_truth_df.cache()
-print(f"train: {train_df.count():,} | validation: {val_df.count():,} | probe: {probe_truth_df.count():,}")
+print(f"split_mode={SPLIT_MODE} | train: {train_df.count():,} | "
+      f"validation: {val_df.count():,} | probe: {probe_truth_df.count():,}")
 
 # COMMAND ----------
 
