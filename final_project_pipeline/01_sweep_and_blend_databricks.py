@@ -31,7 +31,11 @@ import os
 import sys
 import time
 
-sys.path.append(os.path.dirname(os.path.abspath("__file__")))
+# insert(0), not append: the ML runtime pre-installs HuggingFace's `evaluate`
+# package, which shadows this pipeline's evaluate.py unless our folder wins the
+# sys.path race. (Repos auto-prepends the repo root, which hid this until the
+# notebook ran from a plain workspace directory.)
+sys.path.insert(0, os.path.dirname(os.path.abspath("__file__")))
 
 from pyspark.ml.feature import VectorAssembler
 from pyspark.ml.regression import LinearRegression
