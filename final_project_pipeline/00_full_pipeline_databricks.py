@@ -41,6 +41,16 @@ from evaluate import split_train_probe, global_mean_baseline_rmse, evaluate_als_
 DATA_PATH = "/dbfs/netflix_prize_data"  # uploaded via `databricks fs cp` (CLI profile: data612)
 OUTPUT_PATH = "/dbfs/data612_final_project/pipeline_artifacts"
 
+# Staged execution: pass a comma-separated subset via the "data_files" job parameter /
+# widget (e.g. "combined_data_1.txt" for the ~25M-row staging run). Empty = all four files.
+try:
+    dbutils.widgets.text("data_files", "")
+    _files_param = dbutils.widgets.get("data_files").strip()
+except NameError:  # running outside Databricks (local test) -- no dbutils
+    _files_param = ""
+DATA_FILES = [f.strip() for f in _files_param.split(",") if f.strip()] or None  # None = all
+print(f"Data files this run: {DATA_FILES or 'ALL FOUR (full corpus)'}")
+
 RANK = 20          # Project 5's winning rank -- starting point, not yet re-tuned for full scale
 REG_PARAM = 0.1    # same -- plan calls for re-sweeping both on this corpus's own validation slice
 MAX_ITER = 10
@@ -56,7 +66,7 @@ pipeline_start = time.time()
 # COMMAND ----------
 
 t0 = time.time()
-ratings_pd = parse_netflix_full(DATA_PATH)
+ratings_pd = parse_netflix_full(DATA_PATH, files=DATA_FILES)
 print(f"Parsed {len(ratings_pd):,} ratings in {time.time() - t0:.1f}s")
 
 # COMMAND ----------
