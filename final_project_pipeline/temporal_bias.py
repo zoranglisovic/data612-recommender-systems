@@ -40,6 +40,7 @@ EPOCH = "1999-01-01"
 LAMBDA_MOVIE = 25.0
 LAMBDA_USER = 10.0
 LAMBDA_DRIFT = 500.0  # slopes need far more evidence than intercepts
+LAMBDA_BIN = 50.0     # per-(movie, bin) shrinkage toward the movie's overall bias
 
 
 def _add_day_number(df, date_col="date"):
@@ -60,13 +61,14 @@ def compute_global_mean(ratings_df, rating_col="rating"):
 def fit_bias_model(train_df, global_mean, bin_days=30, temporal=True,
                    rating_col="rating", date_col="date",
                    lambda_movie=LAMBDA_MOVIE, lambda_user=LAMBDA_USER,
-                   lambda_drift=LAMBDA_DRIFT):
+                   lambda_drift=LAMBDA_DRIFT, lambda_bin=LAMBDA_BIN):
     """Fits the full bias model on training data. Returns a dict of small
     DataFrames (the "model") that downstream steps join against:
 
       movie_bias_binned : (movie_id, time_bin, movie_bias)     -- temporal only
       movie_bias_overall: (movie_id, movie_bias_overall)       -- always
-      user_model        : (user_id, user_a, user_b, user_tbar) -- b=0 if not temporal
+      user_model        : (user_id, user_a, user_b, user_tbar,
+                           user_tmin, user_tmax)               -- b=0 if not temporal
 
     With temporal=False this degenerates to the classic static user+item bias
     predictor (ablation rung 2); with temporal=True it is rung 3's model.
@@ -79,8 +81,23 @@ def fit_bias_model(train_df, global_mean, bin_days=30, temporal=True,
         (F.sum("dev") / (F.count("dev") + F.lit(lambda_movie))).alias("movie_bias_overall")
     )
     if temporal:
-        movie_bias_binned = df.groupBy("movie_id", "time_bin").agg(
-            (F.sum("dev") / (F.count("dev") + F.lit(lambda_movie))).alias("movie_bias")
+        # Hierarchical shrinkage: each (movie, bin) cell shrinks toward the
+        # movie's OVERALL bias, not toward zero -- a sparse bin then degrades
+        # gracefully to static behavior instead of dragging the prediction
+        # toward the global mean. The first full-corpus run showed the
+        # toward-zero version actively hurt (rung 3 RMSE 1.0708 vs rung 2's
+        # 0.9843); this is the fix, not a tuning tweak.
+        bin_stats = df.groupBy("movie_id", "time_bin").agg(
+            F.sum("dev").alias("bin_sum_dev"), F.count("dev").alias("bin_n")
+        )
+        movie_bias_binned = (
+            bin_stats.join(movie_bias_overall, "movie_id")
+            .withColumn(
+                "movie_bias",
+                (F.col("bin_sum_dev") + F.lit(lambda_bin) * F.col("movie_bias_overall"))
+                / (F.col("bin_n") + F.lit(lambda_bin)),
+            )
+            .select("movie_id", "time_bin", "movie_bias")
         )
     else:
         movie_bias_binned = None
@@ -106,6 +123,8 @@ def fit_bias_model(train_df, global_mean, bin_days=30, temporal=True,
         F.sum("day_num").alias("sum_t"),
         F.sum(F.col("day_num") * F.col("day_num")).alias("sum_t2"),
         F.sum(F.col("day_num") * F.col("user_dev")).alias("sum_t_dev"),
+        F.min("day_num").alias("user_tmin"),
+        F.max("day_num").alias("user_tmax"),
     )
     user_model = stats.withColumn(
         "user_a", F.col("sum_dev") / (F.col("n") + F.lit(lambda_user))
@@ -123,7 +142,9 @@ def fit_bias_model(train_df, global_mean, bin_days=30, temporal=True,
     else:
         user_model = user_model.withColumn("user_b", F.lit(0.0))
 
-    user_model = user_model.select("user_id", "user_a", "user_b", "user_tbar")
+    user_model = user_model.select(
+        "user_id", "user_a", "user_b", "user_tbar", "user_tmin", "user_tmax"
+    )
 
     return {
         "global_mean": global_mean,
@@ -154,10 +175,20 @@ def apply_bias(df, bias_model, date_col="date"):
         )
 
     out = out.join(bias_model["user_model"], "user_id", "left")
+    # Drift is only trusted INSIDE each user's observed rating span. Probe (and
+    # any real future prediction) sits at or beyond the end of a user's history
+    # -- Netflix built probe from each user's most recent ratings -- and linear
+    # extrapolation past the last observed day multiplied small slopes into
+    # large errors on the first full-corpus run. Clamping the evaluation day to
+    # [tmin, tmax] holds the drift at its last observed value instead.
+    out = out.withColumn(
+        "t_eff",
+        F.least(F.greatest(F.col("day_num"), F.col("user_tmin")), F.col("user_tmax")),
+    )
     out = out.withColumn(
         "user_term",
         F.coalesce(
-            F.col("user_a") + F.col("user_b") * (F.col("day_num") - F.col("user_tbar")),
+            F.col("user_a") + F.col("user_b") * (F.col("t_eff") - F.col("user_tbar")),
             F.lit(0.0),
         ),
     )
