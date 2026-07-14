@@ -7,8 +7,12 @@ recommendations.
 Definitions follow the Project 4/5 convention:
 - A probe item is *relevant* for a user if its true rating >= threshold (4.0).
 - Each user's probe items are ranked by predicted rating; the top k form the
-  recommendation list. Only users with at least one relevant probe item and at
-  least k probe items are scored (per-user averages over that population).
+  recommendation list. Users with at least one relevant probe item are scored
+  (per-user averages over that population). Probe averages only ~3 ratings per
+  user, so requiring >= k probe items would leave nobody to score at k=5+ --
+  the first full-scale run failed on exactly that. Users with fewer than k
+  probe items simply can't reach precision 1.0, which is the standard
+  convention's accepted behavior.
 - Coverage = fraction of the full movie catalog that appears in at least one
   user's top-k list.
 
@@ -35,9 +39,7 @@ def precision_recall_at_k(scored_probe_df, k=10, threshold=4.0,
         F.sum("relevant").alias("total_relevant"),
         F.count("*").alias("n_probe_items"),
     )
-    scorable = per_user.filter(
-        (F.col("total_relevant") > 0) & (F.col("n_probe_items") >= k)
-    )
+    scorable = per_user.filter(F.col("total_relevant") > 0)
     row = scorable.agg(
         F.avg(F.col("hits") / F.lit(k)).alias("precision_at_k"),
         F.avg(F.col("hits") / F.col("total_relevant")).alias("recall_at_k"),
@@ -46,8 +48,8 @@ def precision_recall_at_k(scored_probe_df, k=10, threshold=4.0,
     return {
         "k": k,
         "threshold": threshold,
-        "precision_at_k": row["precision_at_k"],
-        "recall_at_k": row["recall_at_k"],
+        "precision_at_k": row["precision_at_k"] if row["n_users"] else float("nan"),
+        "recall_at_k": row["recall_at_k"] if row["n_users"] else float("nan"),
         "n_users_scored": row["n_users"],
     }
 
