@@ -1,26 +1,32 @@
 # Databricks notebook source
 # MAGIC %md
-# MAGIC # DATA 612 Final Project — Sweep + Blend (Rung 6)
+# MAGIC # DATA 612 Final Project — Bias Tuning, ALS Sweep, Blend (Rung 6)
 # MAGIC
-# MAGIC Runs the rank/regParam sweep **at full corpus scale** on a dedicated
-# MAGIC validation slice (never probe), then blends the two best configurations
-# MAGIC from different rank families with a linear regression fit on the same
-# MAGIC validation slice, and finally scores the blend on probe -- the only time
-# MAGIC probe is touched in this notebook.
+# MAGIC Three stages, all tuned on a validation slice carved from training --
+# MAGIC probe is touched exactly once, at the very end:
+# MAGIC
+# MAGIC 1. **Bias λ mini-sweep** (cheap, no ALS): tunes the temporal bias model's
+# MAGIC    shrinkage strengths. The full-corpus ladder runs showed untuned temporal
+# MAGIC    terms actually hurt vs. static bias (0.9978 vs 0.9843 probe RMSE) -- but
+# MAGIC    since the temporal model degenerates to static as λ→∞, tuned λs can at
+# MAGIC    worst tie static. This measures what temporal modeling really buys.
+# MAGIC 2. **ALS rank × regParam sweep** at full corpus scale on the winning bias
+# MAGIC    model's residuals.
+# MAGIC 3. **Blend**: best residual-ALS + a plain raw-ratings ALS -- two
+# MAGIC    structurally different models (the raw model learns biases implicitly in
+# MAGIC    its factors; the residual model gets them explicitly), which gives the
+# MAGIC    blend real diversity. Weights from linear regression on validation.
 # MAGIC
 # MAGIC **Honest deviation from the planning document:** the blend partner is a
-# MAGIC second Spark ALS configuration, not the `surprise` SVD baseline the plan
-# MAGIC named. `surprise` cannot scale to ~100M rows (it is single-machine,
-# MAGIC in-memory SGD) and does not install cleanly on the Databricks ML runtime.
-# MAGIC The blend keeps the plan's actual idea -- two differently-shaped models
-# MAGIC beat either alone, the Prize-winning ensemble principle -- while swapping
-# MAGIC the second model's implementation for one that runs at this scale.
-# MAGIC
-# MAGIC Expect this notebook to be the expensive one: 6 sweep fits + 1 refit at
-# MAGIC full scale, all submitted as one job so the cluster stays warm throughout.
+# MAGIC second Spark ALS, not the `surprise` SVD baseline the plan named --
+# MAGIC `surprise` is single-machine in-memory SGD and cannot scale to ~100M rows.
+# MAGIC The blend keeps the plan's idea (differently-shaped models beat either
+# MAGIC alone, the Prize-winning ensemble principle) with an implementation that
+# MAGIC runs at this scale.
 
 # COMMAND ----------
 
+import json
 import os
 import sys
 import time
@@ -34,7 +40,7 @@ from pyspark.sql import functions as F
 from parser import to_spark_df, load_probe_pairs
 from temporal_bias import compute_global_mean, fit_bias_model, apply_bias, clip_to_scale
 from train_als import fit_als, save_pipeline_artifacts
-from evaluate import split_train_probe, score_predictions, score_als_with_bias
+from evaluate import split_train_probe, score_predictions, score_bias_only
 
 # COMMAND ----------
 
@@ -45,8 +51,9 @@ OUTPUT_PATH = "/dbfs/data612_final_project/sweep_artifacts"
 SEED = 45
 BIN_DAYS = 30
 MAX_ITER = 10
-SWEEP_GRID = [(rank, reg) for rank in (20, 40) for reg in (0.05, 0.1, 0.2)]
-VALIDATION_FRACTION = 0.02  # ~2M rows at full scale -- plenty for tuning + blend weights
+BIAS_GRID = [(lb, ld) for lb in (50.0, 200.0, 1000.0) for ld in (500.0, 5000.0, 50000.0)]
+ALS_GRID = [(rank, reg) for rank in (20, 40) for reg in (0.05, 0.1, 0.2)]
+VALIDATION_FRACTION = 0.02
 
 t_start = time.time()
 
@@ -60,7 +67,6 @@ ratings_df = spark.read.parquet(PARQUET_PATH)
 probe_pairs_df = to_spark_df(spark, load_probe_pairs(DATA_PATH))
 train_full_df, probe_truth_df = split_train_probe(ratings_df, probe_pairs_df)
 
-# validation slice carved from training -- probe stays untouched until the very end
 train_df, val_df = train_full_df.randomSplit(
     [1.0 - VALIDATION_FRACTION, VALIDATION_FRACTION], seed=SEED
 )
@@ -71,125 +77,148 @@ print(f"train: {train_df.count():,} | validation: {val_df.count():,} | probe: {p
 
 # COMMAND ----------
 
-# MAGIC %md ## Bias model (fit once on the sweep's training split)
+# MAGIC %md ## Stage 1 — Bias λ mini-sweep on validation (static baseline included)
 
 # COMMAND ----------
 
-t0 = time.time()
 global_mean = compute_global_mean(train_df)
-bias_model = fit_bias_model(train_df, global_mean, temporal=True, bin_days=BIN_DAYS)
-adjusted = apply_bias(train_df, bias_model)
-als_train = adjusted.select("user_id", "movie_id", "residual").cache()
-als_train.count()  # materialize once; every sweep fit reuses this
-print(f"bias model + residuals ready in {time.time() - t0:.1f}s")
 
-# validation with bias columns precomputed (reused for every config's scoring)
-val_with_bias = apply_bias(val_df, bias_model).cache()
+static_bias = fit_bias_model(train_df, global_mean, temporal=False, bin_days=BIN_DAYS)
+static_val = score_bias_only(val_df, static_bias)
+print(f"static bias (reference)              val RMSE={static_val['rmse']:.4f} MAE={static_val['mae']:.4f}")
+
+bias_sweep = []
+best_bias, best_bias_scores, best_bias_cfg = None, None, None
+for lam_bin, lam_drift in BIAS_GRID:
+    t0 = time.time()
+    bm = fit_bias_model(train_df, global_mean, temporal=True, bin_days=BIN_DAYS,
+                        lambda_bin=lam_bin, lambda_drift=lam_drift)
+    scores = score_bias_only(val_df, bm)
+    bias_sweep.append({"lambda_bin": lam_bin, "lambda_drift": lam_drift, **scores})
+    print(f"lam_bin={lam_bin:<7} lam_drift={lam_drift:<8} val RMSE={scores['rmse']:.4f} "
+          f"MAE={scores['mae']:.4f} ({time.time() - t0:.0f}s)")
+    if best_bias_scores is None or scores["rmse"] < best_bias_scores["rmse"]:
+        best_bias, best_bias_scores = bm, scores
+        best_bias_cfg = {"lambda_bin": lam_bin, "lambda_drift": lam_drift}
+
+temporal_helps = best_bias_scores["rmse"] < static_val["rmse"]
+if not temporal_helps:
+    # honest fallback: if no temporal config beats static on validation, the
+    # static model IS the bias model, and the notebook reports that finding
+    best_bias, best_bias_scores, best_bias_cfg = static_bias, static_val, {"static": True}
+print(f"\nchosen bias model: {best_bias_cfg} (val RMSE {best_bias_scores['rmse']:.4f}, "
+      f"temporal_helps={temporal_helps})")
+
+# COMMAND ----------
+
+# MAGIC %md ## Stage 2 — ALS sweep on the winning bias model's residuals
+
+# COMMAND ----------
+
+adjusted = apply_bias(train_df, best_bias)
+als_train = adjusted.select("user_id", "movie_id", "residual").cache()
+als_train.count()
+val_with_bias = apply_bias(val_df, best_bias).cache()
 val_with_bias.count()
 
-# COMMAND ----------
-
-# MAGIC %md ## Sweep: rank x regParam on the validation slice
-
-# COMMAND ----------
-
-sweep_results = []
+als_sweep = []
 models = {}
-for rank, reg in SWEEP_GRID:
+for rank, reg in ALS_GRID:
     model, fit_secs = fit_als(als_train, rank=rank, reg_param=reg,
                               max_iter=MAX_ITER, seed=SEED, rating_col="residual")
     preds = model.transform(val_with_bias)
     preds = preds.withColumn("raw_pred", F.col("bias_pred") + F.col("prediction"))
     preds = clip_to_scale(preds, "raw_pred", "pred")
     scores = score_predictions(preds, "rating", "pred")
-    sweep_results.append({"rank": rank, "regParam": reg, "fit_seconds": fit_secs, **scores})
+    als_sweep.append({"rank": rank, "regParam": reg, "fit_seconds": fit_secs, **scores})
     models[(rank, reg)] = model
-    print(f"rank={rank:<3} regParam={reg:<5} RMSE={scores['rmse']:.4f} "
-          f"MAE={scores['mae']:.4f} fit={fit_secs:.1f}s")
+    print(f"rank={rank:<3} regParam={reg:<5} val RMSE={scores['rmse']:.4f} "
+          f"MAE={scores['mae']:.4f} fit={fit_secs:.0f}s")
+
+best_als_cfg = min(als_sweep, key=lambda r: r["rmse"])
+model_residual = models[(best_als_cfg["rank"], best_als_cfg["regParam"])]
+print(f"\nbest residual ALS: rank={best_als_cfg['rank']} reg={best_als_cfg['regParam']} "
+      f"val RMSE={best_als_cfg['rmse']:.4f}")
 
 # COMMAND ----------
 
-# MAGIC %md ## Pick blend partners: best config from each rank family
+# MAGIC %md ## Stage 3 — Raw-ratings ALS blend partner (same winning rank/reg)
 
 # COMMAND ----------
 
-by_rank = {}
-for r in sweep_results:
-    best = by_rank.get(r["rank"])
-    if best is None or r["rmse"] < best["rmse"]:
-        by_rank[r["rank"]] = r
-partners = sorted(by_rank.values(), key=lambda r: r["rmse"])
-best_cfg, second_cfg = partners[0], partners[1]
-print(f"best:   rank={best_cfg['rank']} reg={best_cfg['regParam']} RMSE={best_cfg['rmse']:.4f}")
-print(f"second: rank={second_cfg['rank']} reg={second_cfg['regParam']} RMSE={second_cfg['rmse']:.4f}")
-
-model_a = models[(best_cfg["rank"], best_cfg["regParam"])]
-model_b = models[(second_cfg["rank"], second_cfg["regParam"])]
+raw_train = train_df.select("user_id", "movie_id", F.col("rating").cast("float").alias("rating"))
+model_raw, fit_secs = fit_als(raw_train, rank=best_als_cfg["rank"],
+                              reg_param=best_als_cfg["regParam"],
+                              max_iter=MAX_ITER, seed=SEED, rating_col="rating")
+raw_val = model_raw.transform(val_with_bias)
+raw_val_scores = score_predictions(clip_to_scale(raw_val, "prediction", "pred"), "rating", "pred")
+print(f"raw ALS blend partner: val RMSE={raw_val_scores['rmse']:.4f} (fit {fit_secs:.0f}s)")
 
 # COMMAND ----------
 
-# MAGIC %md ## Blend weights: linear regression on validation predictions
+# MAGIC %md ## Blend weights from validation predictions
 
 # COMMAND ----------
 
-t0 = time.time()
-pa = model_a.transform(val_with_bias).withColumnRenamed("prediction", "pred_a")
-pb = (model_b.transform(val_with_bias)
-      .select("user_id", "movie_id", F.col("prediction").alias("pred_b")))
+pa = model_residual.transform(val_with_bias).withColumnRenamed("prediction", "pred_res")
+pb = (model_raw.transform(val_df.select("user_id", "movie_id", "rating"))
+      .select("user_id", "movie_id", F.col("prediction").alias("pred_raw")))
 both = pa.join(pb, ["user_id", "movie_id"])
-both = both.withColumn("full_a", F.col("bias_pred") + F.col("pred_a"))
-both = both.withColumn("full_b", F.col("bias_pred") + F.col("pred_b"))
+both = both.withColumn("full_res", F.col("bias_pred") + F.col("pred_res"))
 
-assembler = VectorAssembler(inputCols=["full_a", "full_b"], outputCol="features")
-blend_train = assembler.transform(both).select("features", F.col("rating").cast("double").alias("label"))
-lr = LinearRegression(featuresCol="features", labelCol="label")
-blend = lr.fit(blend_train)
-w = list(blend.coefficients) + [blend.intercept]
-print(f"blend: pred = {w[0]:.4f}*model_a + {w[1]:.4f}*model_b + {w[2]:.4f}  ({time.time() - t0:.1f}s)")
+assembler = VectorAssembler(inputCols=["full_res", "pred_raw"], outputCol="features")
+blend_train = assembler.transform(both).select(
+    "features", F.col("rating").cast("double").alias("label"))
+blend = LinearRegression(featuresCol="features", labelCol="label").fit(blend_train)
+w_res, w_raw = list(blend.coefficients)
+w0 = blend.intercept
+print(f"blend: pred = {w_res:.4f}*residual_model + {w_raw:.4f}*raw_model + {w0:.4f}")
 
 # COMMAND ----------
 
-# MAGIC %md ## Final scoring on probe (first and only probe touch in this notebook)
+# MAGIC %md ## Final scoring on probe (first and only probe touch)
 
 # COMMAND ----------
 
 probe_rows = probe_truth_df.count()
-probe_bias = apply_bias(probe_truth_df, bias_model)
-qa = model_a.transform(probe_bias).withColumnRenamed("prediction", "pred_a")
-qb = (model_b.transform(probe_bias)
-      .select("user_id", "movie_id", F.col("prediction").alias("pred_b")))
+probe_bias = apply_bias(probe_truth_df, best_bias)
+qa = model_residual.transform(probe_bias).withColumnRenamed("prediction", "pred_res")
+qb = (model_raw.transform(probe_truth_df.select("user_id", "movie_id", "rating"))
+      .select("user_id", "movie_id", F.col("prediction").alias("pred_raw")))
 qboth = qa.join(qb, ["user_id", "movie_id"])
+qboth = qboth.withColumn("full_res", F.col("bias_pred") + F.col("pred_res"))
+
+# each model alone on probe, then the blend
+single_res = score_predictions(clip_to_scale(qboth, "full_res", "p1"), "rating", "p1")
+single_raw = score_predictions(clip_to_scale(qboth, "pred_raw", "p2"), "rating", "p2")
 qboth = qboth.withColumn(
-    "raw_blend",
-    F.lit(w[2]) + F.lit(w[0]) * (F.col("bias_pred") + F.col("pred_a"))
-                + F.lit(w[1]) * (F.col("bias_pred") + F.col("pred_b")),
-)
+    "raw_blend", F.lit(w0) + F.lit(w_res) * F.col("full_res") + F.lit(w_raw) * F.col("pred_raw"))
 qboth = clip_to_scale(qboth, "raw_blend", "pred")
 blend_scores = score_predictions(qboth, "rating", "pred")
+
 dropped = probe_rows - blend_scores["n_scored"]
-print(f"RUNG 6 (blend) — probe RMSE: {blend_scores['rmse']:.4f}  MAE: {blend_scores['mae']:.4f}")
+print(f"probe — residual ALS alone:  RMSE={single_res['rmse']:.4f} MAE={single_res['mae']:.4f}")
+print(f"probe — raw ALS alone:       RMSE={single_raw['rmse']:.4f} MAE={single_raw['mae']:.4f}")
+print(f"probe — BLEND (rung 6):      RMSE={blend_scores['rmse']:.4f} MAE={blend_scores['mae']:.4f}")
 print(f"scored {blend_scores['n_scored']:,}/{probe_rows:,} ({dropped/probe_rows:.2%} dropped)")
 
-# best single model on probe, for the ladder comparison
-single_scores = score_als_with_bias(model_a, bias_model, probe_truth_df, probe_rows)
-print(f"best single config on probe — RMSE: {single_scores['rmse']:.4f}  MAE: {single_scores['mae']:.4f}")
+# COMMAND ----------
+
+# MAGIC %md ## Save winning artifacts + results
 
 # COMMAND ----------
 
-# MAGIC %md ## Save winning artifacts
-
-# COMMAND ----------
-
-import json
-
-save_pipeline_artifacts(OUTPUT_PATH, model_a, bias_model)
+save_pipeline_artifacts(OUTPUT_PATH, model_residual, best_bias)
+model_raw.write().overwrite().save(OUTPUT_PATH.replace("/dbfs", "dbfs:", 1) + "/als_model_raw")
 with open(os.path.join(OUTPUT_PATH, "sweep_results.json"), "w") as f:
     json.dump({
-        "sweep": sweep_results,
-        "best": best_cfg, "second": second_cfg,
-        "blend_weights": {"w_a": w[0], "w_b": w[1], "intercept": w[2]},
-        "probe_blend": blend_scores, "probe_best_single": single_scores,
+        "static_bias_val": static_val, "bias_sweep": bias_sweep,
+        "best_bias_cfg": best_bias_cfg, "temporal_helps": bool(temporal_helps),
+        "als_sweep": als_sweep, "best_als_cfg": best_als_cfg,
+        "raw_partner_val": raw_val_scores,
+        "blend_weights": {"w_res": w_res, "w_raw": w_raw, "intercept": w0},
+        "probe": {"residual_alone": single_res, "raw_alone": single_raw,
+                  "blend": blend_scores},
     }, f, indent=2, default=float)
-model_b.write().overwrite().save(OUTPUT_PATH.replace("/dbfs", "dbfs:", 1) + "/als_model_b")
 print(f"saved to {OUTPUT_PATH}")
 print(f"\nTOTAL: {time.time() - t_start:.1f}s")
