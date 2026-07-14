@@ -28,16 +28,28 @@ COMBINED_FILES = [
 ]
 
 
-def parse_netflix_full(data_path, files=None, progress=True):
-    """Read every combined_data file into one flat pandas DataFrame.
+def _flush_chunk(movie_ids, user_ids, ratings, dates):
+    return pd.DataFrame(
+        {
+            "movie_id": np.array(movie_ids, dtype=np.int32),
+            "user_id": np.array(user_ids, dtype=np.int32),
+            "rating": np.array(ratings, dtype=np.int8),
+            "date": np.array(dates, dtype="datetime64[D]"),
+        }
+    )
 
-    Columns: movie_id (int32), user_id (int32), rating (int8), date (datetime64).
-    Explicit dtypes matter here -- at ~100M rows, int64/object columns would use
-    2-4x the memory of int32/int8/datetime64 for no benefit.
+
+def parse_netflix_chunks(data_path, files=None, chunk_rows=5_000_000, progress=True):
+    """Generator yielding pandas DataFrames of at most chunk_rows ratings each.
+
+    The v1 parse-everything-into-Python-lists approach crashed the Databricks
+    driver (OOM) on the full 100M-row corpus -- ~100M small Python objects per
+    column costs 15-20GB+ of Python heap, on a driver whose 32GB is shared with
+    the Spark JVM. Chunked parsing bounds peak memory at one chunk (~5M rows,
+    a few hundred MB) regardless of corpus size. The staged 24M-row run survived
+    v1 only because a quarter of the corpus still fit; this works at any scale.
     """
     files = files or COMBINED_FILES
-    movie_ids, user_ids, ratings, dates = [], [], [], []
-
     for fname in files:
         filepath = os.path.join(data_path, fname)
         if not os.path.exists(filepath):
@@ -48,6 +60,7 @@ def parse_netflix_full(data_path, files=None, progress=True):
         t0 = time.time()
         current_movie = None
         file_rows = 0
+        movie_ids, user_ids, ratings, dates = [], [], [], []
         with open(filepath, "r") as f:
             for line in f:
                 line = line.strip()
@@ -60,18 +73,43 @@ def parse_netflix_full(data_path, files=None, progress=True):
                     ratings.append(int(rating))
                     dates.append(date)
                     file_rows += 1
+                    if len(movie_ids) >= chunk_rows:
+                        yield _flush_chunk(movie_ids, user_ids, ratings, dates)
+                        movie_ids, user_ids, ratings, dates = [], [], [], []
+        if movie_ids:
+            yield _flush_chunk(movie_ids, user_ids, ratings, dates)
         if progress:
             print(f"{fname}: {file_rows:,} ratings in {time.time() - t0:.1f}s")
 
-    df = pd.DataFrame(
-        {
-            "movie_id": np.array(movie_ids, dtype=np.int32),
-            "user_id": np.array(user_ids, dtype=np.int32),
-            "rating": np.array(ratings, dtype=np.int8),
-            "date": pd.to_datetime(dates),
-        }
-    )
-    return df
+
+def convert_to_parquet(data_path, parquet_path, files=None, chunk_rows=5_000_000,
+                       progress=True):
+    """One-time conversion: raw Netflix text format -> chunked Parquet.
+
+    Run once; every pipeline run afterward (including every sweep fit) does
+    spark.read.parquet(parquet_path) instead of re-parsing ~2GB of text --
+    faster, and immune to the driver-OOM failure mode above. Parquet files are
+    written per-chunk so peak memory stays bounded.
+    """
+    os.makedirs(parquet_path, exist_ok=True)
+    total = 0
+    for i, chunk in enumerate(parse_netflix_chunks(data_path, files=files,
+                                                   chunk_rows=chunk_rows,
+                                                   progress=progress)):
+        out_file = os.path.join(parquet_path, f"part_{i:04d}.parquet")
+        chunk.to_parquet(out_file, index=False)
+        total += len(chunk)
+        if progress:
+            print(f"  wrote {out_file} ({len(chunk):,} rows, {total:,} total)")
+    return total
+
+
+def parse_netflix_full(data_path, files=None, progress=True):
+    """Full corpus as one pandas DataFrame. Fine for subsets (tests, staged
+    runs); do NOT call on all four files on a Databricks driver -- use
+    convert_to_parquet + spark.read.parquet instead (see docstrings above)."""
+    chunks = list(parse_netflix_chunks(data_path, files=files, progress=progress))
+    return pd.concat(chunks, ignore_index=True) if chunks else _flush_chunk([], [], [], [])
 
 
 def to_spark_df(spark, pandas_df):
