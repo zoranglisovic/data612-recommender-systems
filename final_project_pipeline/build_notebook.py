@@ -250,7 +250,7 @@ bars[-1].set_color("seagreen")
 ax.axvline(0.8567, color="firebrick", linestyle="--", linewidth=1.4,
            label="Netflix Prize winner (0.8567)")
 ax.axvline(0.9514, color="darkorange", linestyle=":", linewidth=1.4,
-           label="Cinematch (0.9514)")
+           label="Cinematch benchmark (0.9514)")
 for bar, rmse_value in zip(bars, ladder_frame["probe_rmse"]):
     ax.text(bar.get_width() + 0.004, bar.get_y() + bar.get_height() / 2,
             f"{rmse_value:.4f}", va="center", fontsize=9, color="dimgray")
@@ -262,29 +262,31 @@ ax.set_title("Ablation ladder on the full Netflix Prize corpus")
 plt.tight_layout()
 plt.show()"""))
 
-cells.append(md("""The blend lands at 0.9182 — past Cinematch, Netflix's own production system at the time, by 3.5%, with 0.06 still separating it from the winning ensemble. That gap is honest and explainable: 0.8567 was the blended output of a hundred-plus models built by a team over roughly three years, and the single largest published solo-technique gains beyond what's here (implicit-feedback signals, full per-user factor drift) were explicitly scoped out of this project's timeline in the planning document."""))
+cells.append(md("""The blend lands at 0.9182 — below the historical Cinematch benchmark of 0.9514, with 0.06 still separating it from the winning ensemble. One precision note on that comparison: Cinematch's published score was measured on the competition's quiz set, a sibling hold-out to probe built the same way, so the numbers are comparable in spirit rather than on literally the same rows. The remaining gap is honest and explainable: 0.8567 was the blended output of a hundred-plus models built by a team over roughly three years, and the single largest published solo-technique gains beyond what's here (implicit-feedback signals, full per-user factor drift) were explicitly scoped out of this project's timeline in the planning document."""))
 
 # ---------------------------------------------------------------- 8. beyond accuracy
 cells.append(md("""## 8. Beyond Accuracy
 
-A falling RMSE doesn't by itself mean the recommendations got better — a model can minimize error while recommending the same fifty safe movies to everyone. Two checks against that, computed on the tuned model's probe predictions: ranking quality (precision@k and recall@k, relevance meaning a true rating of 4+) and catalog coverage (how much of the 17,770-movie catalog ever appears in a top-10)."""))
+A falling RMSE doesn't by itself mean the recommendations got better — a model can minimize error while recommending the same fifty safe movies to everyone. Two checks against that, computed on the final blended model's probe predictions: ranking quality (precision@k and recall@k, relevance meaning a true rating of 4+) and catalog coverage (how much of the 17,770-movie catalog ever appears in a top-10)."""))
 
-cells.append(code("""tuned_probe_preds = (tuned_residual_model.transform(probe_with_bias)
-                     .withColumn("raw_pred", F.col("bias_pred") + F.col("prediction")))
-tuned_probe_preds = clip_to_scale(tuned_probe_preds, "raw_pred", "pred").cache()
+cells.append(code("""# the blend predictions from Section 7 are the final model's -- score ranking quality on those
+final_probe_preds = (blend_input
+                     .select("user_id", "movie_id", "rating",
+                             F.col("pred_blend").alias("pred"))
+                     .cache())
 
 for k in (5, 10):
-    ranking = precision_recall_at_k(tuned_probe_preds, k=k, threshold=4.0)
+    ranking = precision_recall_at_k(final_probe_preds, k=k, threshold=4.0)
     print(f"k={k}:  precision {ranking['precision_at_k']:.4f}   "
           f"recall {ranking['recall_at_k']:.4f}   users {ranking['n_users_scored']:,}")
 
-coverage = catalog_coverage(tuned_probe_preds, catalog_size=17_770, k=10)
+coverage = catalog_coverage(final_probe_preds, catalog_size=17_770, k=10)
 print(f"coverage@10: {coverage['movies_recommended']:,} of {coverage['catalog_size']:,} "
       f"movies = {coverage['coverage']:.2%}")"""))
 
 cells.append(md("""Coverage is the notable number: 95% of the catalog appears in at least one user's top-10, so the model personalizes rather than converging on a popularity shortlist. The ranking metrics need a caveat read alongside them — probe averages about three ratings per user, so recall@5 saturates by construction and precision is the informative figure. And one framing caveat on top: these are computed over probe's candidate sets, not over full-catalog ranking, because probe only carries truth for the pairs Netflix held out. A production top-N evaluation would need the qualifying-style full scoring below plus real user feedback."""))
 
-cells.append(md("""The pipeline also produces a prediction file for `qualifying.txt` — the exact submission format the 2006 competition scored, one prediction per (user, date) row under each movie header. Netflix never published that answer key, so the file can't be scored; producing it demonstrates the system runs end to end in the competition's own terms. The generation ran as part of the batch pipeline (2,817,131 predictions, matching the qualifying set's documented size); the first lines are shown here."""))
+cells.append(md("""The qualifying-file demonstration stays on the tuned single model the batch pipeline serves from its saved artifacts — a prediction file for `qualifying.txt`, the exact submission format the 2006 competition scored, one prediction per (user, date) row under each movie header. Netflix never published that answer key, so the file can't be scored; producing it demonstrates the system runs end to end in the competition's own terms. The generation ran as part of the batch pipeline (2,817,131 predictions, matching the qualifying set's documented size); the first lines are shown here."""))
 
 cells.append(code("""qualifying_file = "../Final Project/data_local/qualifying_predictions.txt"
 if os.path.exists(qualifying_file):
@@ -335,7 +337,7 @@ cells.append(md("""## 11. Summary
 
 **Key findings:**
 - The full 100,480,507-rating corpus is tractable end to end on both a single Databricks node and a laptop, once parsing is a one-time Parquet conversion — and the numbers reproduce exactly across platforms.
-- The ablation ladder runs 1.1296 → 0.9843 → 0.9978 → 0.9373 → 0.9692 → **0.9182** (RMSE, probe), with MAE tracking the same ordering. The blend beats Cinematch's 0.9514 by 3.5%; the 0.8567 Prize-winning line stays 0.06 away and honestly explained.
+- The ablation ladder runs 1.1296 → 0.9843 → 0.9978 → 0.9373 → 0.9692 → **0.9182** (RMSE, probe), with MAE tracking the same ordering. The blend lands below the historical Cinematch benchmark of 0.9514; the 0.8567 Prize-winning line stays 0.06 away and honestly explained.
 - Temporal bias modeling contributes ~0.002 RMSE after honest tuning — real but marginal, and only measurable because every component was ablated on the same split.
 - The sharpest lesson was methodological: a random validation slice over-promised by 0.17 RMSE because probe is future-shaped. Tuning on a split with the deployment distribution's shape fixed the estimates without changing the winning configuration.
 - 95% catalog coverage at top-10 says the accuracy gains did not come from popularity collapse.
