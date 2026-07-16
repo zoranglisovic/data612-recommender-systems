@@ -27,6 +27,8 @@ cells.append(md("""# Final Project — A Temporal-Bias-Adjusted ALS Recommender 
 **Zoran Glisovic**
 **DATA 612 — Recommender Systems, Summer 2026**
 
+**Video walkthrough:** https://youtu.be/RGdu3EBRS_A
+
 Projects 1 through 5 built one recommender system on progressively larger curated slices of the Netflix Prize data. This final project drops the curation: all four `combined_data` files, every user, every movie — 100,480,507 ratings — evaluated the way the original competition scored itself, against the `probe.txt` hold-out set. The system is a temporal-bias-adjusted ALS blended with a raw-ratings ALS, tuned at full scale on Azure Databricks, with every modeling choice measured on an ablation ladder rather than asserted. The pipeline modules this notebook imports, the batch scripts that ran the expensive sweeps, and the recorded results all live in `final_project_pipeline/` in this repo."""))
 
 # ---------------------------------------------------------------- 1. theory
